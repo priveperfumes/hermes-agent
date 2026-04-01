@@ -950,17 +950,36 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
     return block
 
 
-def _to_plain_data(value: Any) -> Any:
-    """Recursively convert SDK objects to plain Python data structures."""
+def _to_plain_data(value: Any, *, _depth: int = 0, _seen: Optional[set] = None) -> Any:
+    """Recursively convert SDK objects to plain Python data structures.
+
+    Guards against circular references (``_seen`` tracks ``id()`` of visited
+    objects) and runaway depth (capped at 20 levels).
+    """
+    _MAX_DEPTH = 20
+    if _depth > _MAX_DEPTH:
+        return str(value)
+
+    if _seen is None:
+        _seen = set()
+
+    obj_id = id(value)
+    if obj_id in _seen:
+        return str(value)
+
     if hasattr(value, "model_dump"):
-        return _to_plain_data(value.model_dump())
+        _seen.add(obj_id)
+        return _to_plain_data(value.model_dump(), _depth=_depth + 1, _seen=_seen)
     if isinstance(value, dict):
-        return {k: _to_plain_data(v) for k, v in value.items()}
+        _seen.add(obj_id)
+        return {k: _to_plain_data(v, _depth=_depth + 1, _seen=_seen) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_to_plain_data(v) for v in value]
+        _seen.add(obj_id)
+        return [_to_plain_data(v, _depth=_depth + 1, _seen=_seen) for v in value]
     if hasattr(value, "__dict__"):
+        _seen.add(obj_id)
         return {
-            k: _to_plain_data(v)
+            k: _to_plain_data(v, _depth=_depth + 1, _seen=_seen)
             for k, v in vars(value).items()
             if not k.startswith("_")
         }

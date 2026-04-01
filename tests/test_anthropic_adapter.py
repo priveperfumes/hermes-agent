@@ -11,6 +11,7 @@ from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import (
     _is_oauth_token,
     _refresh_oauth_token,
+    _to_plain_data,
     _write_claude_code_credentials,
     build_anthropic_client,
     build_anthropic_kwargs,
@@ -1115,6 +1116,53 @@ class TestGetAnthropicMaxOutput:
         from agent.anthropic_adapter import _get_anthropic_max_output
         # claude-3-5-sonnet (8192) should win over a hypothetical shorter match
         assert _get_anthropic_max_output("claude-3-5-sonnet-20241022") == 8_192
+
+
+# ---------------------------------------------------------------------------
+# _to_plain_data hardening
+# ---------------------------------------------------------------------------
+
+
+class TestToPlainData:
+    def test_simple_dict(self):
+        assert _to_plain_data({"a": 1, "b": [2, 3]}) == {"a": 1, "b": [2, 3]}
+
+    def test_pydantic_like_model_dump(self):
+        class FakeModel:
+            def model_dump(self):
+                return {"type": "thinking", "thinking": "hello"}
+
+        result = _to_plain_data(FakeModel())
+        assert result == {"type": "thinking", "thinking": "hello"}
+
+    def test_circular_reference_does_not_recurse_forever(self):
+        """Circular dict reference should be stringified, not infinite-loop."""
+        d: dict = {"key": "value"}
+        d["self"] = d  # circular
+        result = _to_plain_data(d)
+        assert isinstance(result, dict)
+        assert result["key"] == "value"
+        # The circular ref should be stringified rather than causing RecursionError
+        assert isinstance(result["self"], str)
+
+    def test_deep_nesting_is_capped(self):
+        """Deeply nested structures beyond 20 levels should be stringified."""
+        deep = "leaf"
+        for _ in range(25):
+            deep = {"nested": deep}
+        result = _to_plain_data(deep)
+        # Should complete without error; deepest levels get stringified
+        assert isinstance(result, dict)
+
+    def test_plain_values_pass_through(self):
+        assert _to_plain_data("hello") == "hello"
+        assert _to_plain_data(42) == 42
+        assert _to_plain_data(None) is None
+
+    def test_object_with_dunder_dict(self):
+        obj = SimpleNamespace(type="thinking", thinking="reason", signature="sig")
+        result = _to_plain_data(obj)
+        assert result == {"type": "thinking", "thinking": "reason", "signature": "sig"}
 
 
 # ---------------------------------------------------------------------------
