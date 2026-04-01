@@ -742,6 +742,33 @@ class TestConvertMessages:
         assert tool_block["content"] == "result"
         assert tool_block["cache_control"] == {"type": "ephemeral"}
 
+    def test_preserved_thinking_blocks_are_rehydrated_before_tool_use(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "test_tool", "arguments": "{}"}},
+                ],
+                "reasoning_details": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Need to inspect the tool result first.",
+                        "signature": "sig_123",
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "tool output"},
+        ]
+
+        _, result = convert_messages_to_anthropic(messages)
+        assistant_blocks = next(msg for msg in result if msg["role"] == "assistant")["content"]
+
+        assert assistant_blocks[0]["type"] == "thinking"
+        assert assistant_blocks[0]["thinking"] == "Need to inspect the tool result first."
+        assert assistant_blocks[0]["signature"] == "sig_123"
+        assert assistant_blocks[1]["type"] == "tool_use"
+
     def test_converts_data_url_image_to_anthropic_image_block(self):
         messages = [
             {
@@ -1002,6 +1029,17 @@ class TestBuildAnthropicKwargs:
         )
         assert kwargs["max_tokens"] == 128_000
 
+    def test_request_cache_control_added_to_kwargs(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            request_cache_control={"type": "ephemeral"},
+        )
+        assert kwargs["cache_control"] == {"type": "ephemeral"}
+
     def test_explicit_max_tokens_overrides_default(self):
         """User-specified max_tokens should be respected."""
         kwargs = build_anthropic_kwargs(
@@ -1126,6 +1164,20 @@ class TestNormalizeResponse:
         msg, reason = normalize_anthropic_response(self._make_response(blocks))
         assert msg.content == "The answer is 42."
         assert msg.reasoning == "Let me reason about this..."
+        assert msg.reasoning_details == [{"type": "thinking", "thinking": "Let me reason about this..."}]
+
+    def test_thinking_response_preserves_signature(self):
+        blocks = [
+            SimpleNamespace(
+                type="thinking",
+                thinking="Let me reason about this...",
+                signature="opaque_signature",
+                redacted=False,
+            ),
+        ]
+        msg, _ = normalize_anthropic_response(self._make_response(blocks))
+        assert msg.reasoning_details[0]["signature"] == "opaque_signature"
+        assert msg.reasoning_details[0]["thinking"] == "Let me reason about this..."
 
     def test_stop_reason_mapping(self):
         block = SimpleNamespace(type="text", text="x")
