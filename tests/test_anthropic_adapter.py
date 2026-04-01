@@ -1176,6 +1176,17 @@ class TestToPlainData:
         # The circular ref should be stringified rather than causing RecursionError
         assert isinstance(result["self"], str)
 
+    def test_shared_sibling_objects_are_not_falsely_detected_as_cycles(self):
+        """Two siblings referencing the same dict must both be converted."""
+        shared = {"type": "thinking", "thinking": "reason"}
+        parent = {"a": shared, "b": shared}
+        result = _to_plain_data(parent)
+        assert result["a"] == {"type": "thinking", "thinking": "reason"}
+        assert result["b"] == {"type": "thinking", "thinking": "reason"}
+        # Both must be dicts, not stringified
+        assert isinstance(result["a"], dict)
+        assert isinstance(result["b"], dict)
+
     def test_deep_nesting_is_capped(self):
         """Deeply nested structures beyond 20 levels should be stringified."""
         deep = "leaf"

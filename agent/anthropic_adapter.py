@@ -950,39 +950,49 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
     return block
 
 
-def _to_plain_data(value: Any, *, _depth: int = 0, _seen: Optional[set] = None) -> Any:
+def _to_plain_data(value: Any, *, _depth: int = 0, _path: Optional[set] = None) -> Any:
     """Recursively convert SDK objects to plain Python data structures.
 
-    Guards against circular references (``_seen`` tracks ``id()`` of visited
-    objects) and runaway depth (capped at 20 levels).
+    Guards against circular references (``_path`` tracks ``id()`` of objects
+    on the *current* recursion path) and runaway depth (capped at 20 levels).
+    Uses path-based tracking so shared (but non-cyclic) objects referenced by
+    multiple siblings are converted correctly rather than being stringified.
     """
     _MAX_DEPTH = 20
     if _depth > _MAX_DEPTH:
         return str(value)
 
-    if _seen is None:
-        _seen = set()
+    if _path is None:
+        _path = set()
 
     obj_id = id(value)
-    if obj_id in _seen:
+    if obj_id in _path:
         return str(value)
 
     if hasattr(value, "model_dump"):
-        _seen.add(obj_id)
-        return _to_plain_data(value.model_dump(), _depth=_depth + 1, _seen=_seen)
+        _path.add(obj_id)
+        result = _to_plain_data(value.model_dump(), _depth=_depth + 1, _path=_path)
+        _path.discard(obj_id)
+        return result
     if isinstance(value, dict):
-        _seen.add(obj_id)
-        return {k: _to_plain_data(v, _depth=_depth + 1, _seen=_seen) for k, v in value.items()}
+        _path.add(obj_id)
+        result = {k: _to_plain_data(v, _depth=_depth + 1, _path=_path) for k, v in value.items()}
+        _path.discard(obj_id)
+        return result
     if isinstance(value, (list, tuple)):
-        _seen.add(obj_id)
-        return [_to_plain_data(v, _depth=_depth + 1, _seen=_seen) for v in value]
+        _path.add(obj_id)
+        result = [_to_plain_data(v, _depth=_depth + 1, _path=_path) for v in value]
+        _path.discard(obj_id)
+        return result
     if hasattr(value, "__dict__"):
-        _seen.add(obj_id)
-        return {
-            k: _to_plain_data(v, _depth=_depth + 1, _seen=_seen)
+        _path.add(obj_id)
+        result = {
+            k: _to_plain_data(v, _depth=_depth + 1, _path=_path)
             for k, v in vars(value).items()
             if not k.startswith("_")
         }
+        _path.discard(obj_id)
+        return result
     return value
 
 
