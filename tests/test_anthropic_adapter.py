@@ -11,6 +11,7 @@ from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import (
     _is_oauth_token,
     _refresh_oauth_token,
+    _to_plain_data,
     _write_claude_code_credentials,
     build_anthropic_client,
     build_anthropic_kwargs,
@@ -742,6 +743,33 @@ class TestConvertMessages:
         assert tool_block["content"] == "result"
         assert tool_block["cache_control"] == {"type": "ephemeral"}
 
+    def test_preserved_thinking_blocks_are_rehydrated_before_tool_use(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "test_tool", "arguments": "{}"}},
+                ],
+                "reasoning_details": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Need to inspect the tool result first.",
+                        "signature": "sig_123",
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "tool output"},
+        ]
+
+        _, result = convert_messages_to_anthropic(messages)
+        assistant_blocks = next(msg for msg in result if msg["role"] == "assistant")["content"]
+
+        assert assistant_blocks[0]["type"] == "thinking"
+        assert assistant_blocks[0]["thinking"] == "Need to inspect the tool result first."
+        assert assistant_blocks[0]["signature"] == "sig_123"
+        assert assistant_blocks[1]["type"] == "tool_use"
+
     def test_converts_data_url_image_to_anthropic_image_block(self):
         messages = [
             {
@@ -1002,6 +1030,48 @@ class TestBuildAnthropicKwargs:
         )
         assert kwargs["max_tokens"] == 128_000
 
+    def test_request_cache_control_added_to_kwargs(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            request_cache_control={"type": "ephemeral"},
+        )
+        assert kwargs["cache_control"] == {"type": "ephemeral"}
+
+    def test_request_cache_control_works_with_oauth(self):
+        """OAuth transforms and request-level cache_control must coexist."""
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[{"type": "function", "function": {"name": "test_tool", "parameters": {}}}],
+            max_tokens=4096,
+            reasoning_config=None,
+            is_oauth=True,
+            request_cache_control={"type": "ephemeral"},
+        )
+        # Cache control should be present
+        assert kwargs["cache_control"] == {"type": "ephemeral"}
+        # OAuth transforms should also be applied
+        assert any(t["name"].startswith("mcp_") for t in kwargs["tools"])
+        # System should have Claude Code prefix
+        system_text = str(kwargs["system"])
+        assert "Claude Code" in system_text
+
+    def test_request_cache_control_absent_when_none(self):
+        """cache_control key should not appear when request_cache_control is None."""
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            request_cache_control=None,
+        )
+        assert "cache_control" not in kwargs
+
     def test_explicit_max_tokens_overrides_default(self):
         """User-specified max_tokens should be respected."""
         kwargs = build_anthropic_kwargs(
@@ -1080,6 +1150,64 @@ class TestGetAnthropicMaxOutput:
 
 
 # ---------------------------------------------------------------------------
+# _to_plain_data hardening
+# ---------------------------------------------------------------------------
+
+
+class TestToPlainData:
+    def test_simple_dict(self):
+        assert _to_plain_data({"a": 1, "b": [2, 3]}) == {"a": 1, "b": [2, 3]}
+
+    def test_pydantic_like_model_dump(self):
+        class FakeModel:
+            def model_dump(self):
+                return {"type": "thinking", "thinking": "hello"}
+
+        result = _to_plain_data(FakeModel())
+        assert result == {"type": "thinking", "thinking": "hello"}
+
+    def test_circular_reference_does_not_recurse_forever(self):
+        """Circular dict reference should be stringified, not infinite-loop."""
+        d: dict = {"key": "value"}
+        d["self"] = d  # circular
+        result = _to_plain_data(d)
+        assert isinstance(result, dict)
+        assert result["key"] == "value"
+        # The circular ref should be stringified rather than causing RecursionError
+        assert isinstance(result["self"], str)
+
+    def test_shared_sibling_objects_are_not_falsely_detected_as_cycles(self):
+        """Two siblings referencing the same dict must both be converted."""
+        shared = {"type": "thinking", "thinking": "reason"}
+        parent = {"a": shared, "b": shared}
+        result = _to_plain_data(parent)
+        assert result["a"] == {"type": "thinking", "thinking": "reason"}
+        assert result["b"] == {"type": "thinking", "thinking": "reason"}
+        # Both must be dicts, not stringified
+        assert isinstance(result["a"], dict)
+        assert isinstance(result["b"], dict)
+
+    def test_deep_nesting_is_capped(self):
+        """Deeply nested structures beyond 20 levels should be stringified."""
+        deep = "leaf"
+        for _ in range(25):
+            deep = {"nested": deep}
+        result = _to_plain_data(deep)
+        # Should complete without error; deepest levels get stringified
+        assert isinstance(result, dict)
+
+    def test_plain_values_pass_through(self):
+        assert _to_plain_data("hello") == "hello"
+        assert _to_plain_data(42) == 42
+        assert _to_plain_data(None) is None
+
+    def test_object_with_dunder_dict(self):
+        obj = SimpleNamespace(type="thinking", thinking="reason", signature="sig")
+        result = _to_plain_data(obj)
+        assert result == {"type": "thinking", "thinking": "reason", "signature": "sig"}
+
+
+# ---------------------------------------------------------------------------
 # Response normalization
 # ---------------------------------------------------------------------------
 
@@ -1126,6 +1254,20 @@ class TestNormalizeResponse:
         msg, reason = normalize_anthropic_response(self._make_response(blocks))
         assert msg.content == "The answer is 42."
         assert msg.reasoning == "Let me reason about this..."
+        assert msg.reasoning_details == [{"type": "thinking", "thinking": "Let me reason about this..."}]
+
+    def test_thinking_response_preserves_signature(self):
+        blocks = [
+            SimpleNamespace(
+                type="thinking",
+                thinking="Let me reason about this...",
+                signature="opaque_signature",
+                redacted=False,
+            ),
+        ]
+        msg, _ = normalize_anthropic_response(self._make_response(blocks))
+        assert msg.reasoning_details[0]["signature"] == "opaque_signature"
+        assert msg.reasoning_details[0]["thinking"] == "Let me reason about this..."
 
     def test_stop_reason_mapping(self):
         block = SimpleNamespace(type="text", text="x")

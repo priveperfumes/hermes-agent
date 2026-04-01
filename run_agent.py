@@ -88,7 +88,7 @@ from agent.model_metadata import (
 )
 from agent.context_compressor import ContextCompressor
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -353,6 +353,31 @@ def _inject_honcho_turn_context(content, turn_context: str):
         "[System note: The following Honcho memory was retrieved from prior "
         "sessions. It is continuity context for this turn only, not new user "
         "input.]\n\n"
+        f"{turn_context}"
+    )
+
+    if isinstance(content, list):
+        return list(content) + [{"type": "text", "text": note}]
+
+    text = "" if content is None else str(content)
+    if not text.strip():
+        return note
+    return f"{text}\n\n{note}"
+
+
+def _inject_turn_scoped_system_context(content, turn_context: str):
+    """Append turn-only guidance to the live user turn without mutating history.
+
+    Keeping per-turn system guidance out of the cached system prompt preserves
+    Anthropic/OpenRouter cache hits while still applying the guidance to the
+    current request.
+    """
+    if not turn_context:
+        return content
+
+    note = (
+        "[System note: The following guidance applies to this turn only. It is "
+        "instructional context, not new user input.]\n\n"
         f"{turn_context}"
     )
 
@@ -669,13 +694,16 @@ class AIAgent:
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         
-        # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
-        # Reduces input costs by ~75% on multi-turn conversations by caching the
-        # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
+        # Anthropic prompt caching:
+        # - OpenRouter Claude models use explicit block-level breakpoints.
+        # - Native Anthropic uses request-level automatic caching.
         is_openrouter = self._is_openrouter_url()
         is_claude = "claude" in self.model.lower()
         is_native_anthropic = self.api_mode == "anthropic_messages"
         self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
+        self._use_native_anthropic_auto_cache = (
+            is_native_anthropic and (self.provider == "anthropic" or "api.anthropic.com" in self._base_url_lower)
+        )
         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
         
         # Iteration budget pressure: warn the LLM as it approaches max_iterations.
@@ -1505,7 +1533,12 @@ class AIAgent:
             for detail in assistant_message.reasoning_details:
                 if isinstance(detail, dict):
                     # Extract summary from reasoning detail object
-                    summary = detail.get('summary') or detail.get('content') or detail.get('text')
+                    summary = (
+                        detail.get('summary')
+                        or detail.get('thinking')
+                        or detail.get('content')
+                        or detail.get('text')
+                    )
                     if summary and summary not in reasoning_parts:
                         reasoning_parts.append(summary)
 
@@ -4729,6 +4762,9 @@ class AIAgent:
                 ("openrouter" in fb_base_url.lower() and "claude" in fb_model.lower())
                 or is_native_anthropic
             )
+            self._use_native_anthropic_auto_cache = (
+                is_native_anthropic and (fb_provider == "anthropic" or "api.anthropic.com" in fb_base_url.lower())
+            )
 
             # Update context compressor limits for the fallback model.
             # Without this, compression decisions use the primary model's
@@ -4913,6 +4949,16 @@ class AIAgent:
         base = (getattr(self, "base_url", "") or "").lower()
         return "dashscope" in base or "aliyuncs" in base
 
+    def _anthropic_request_cache_control(self) -> Optional[Dict[str, str]]:
+        """Return native Anthropic automatic cache config when supported."""
+        if not getattr(self, "_use_native_anthropic_auto_cache", False):
+            return None
+
+        marker: Dict[str, str] = {"type": "ephemeral"}
+        if self._cache_ttl == "1h":
+            marker["ttl"] = "1h"
+        return marker
+
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
         if self.api_mode == "anthropic_messages":
@@ -4931,6 +4977,7 @@ class AIAgent:
                 is_oauth=self._is_anthropic_oauth,
                 preserve_dots=self._anthropic_preserve_dots(),
                 context_length=ctx_len,
+                request_cache_control=self._anthropic_request_cache_control(),
             )
 
         if self.api_mode == "codex_responses":
@@ -5023,19 +5070,6 @@ class AIAgent:
                         if isinstance(tool_call, dict):
                             tool_call.pop("call_id", None)
                             tool_call.pop("response_item_id", None)
-
-        # GPT-5 and Codex models respond better to 'developer' than 'system'
-        # for instruction-following.  Swap the role at the API boundary so
-        # internal message representation stays uniform ("system").
-        _model_lower = (self.model or "").lower()
-        if (
-            sanitized_messages
-            and sanitized_messages[0].get("role") == "system"
-            and any(p in _model_lower for p in DEVELOPER_ROLE_MODELS)
-        ):
-            # Shallow-copy the list + first message only — rest stays shared.
-            sanitized_messages = list(sanitized_messages)
-            sanitized_messages[0] = {**sanitized_messages[0], "role": "developer"}
 
         provider_preferences = {}
         if self.providers_allowed:
@@ -6711,11 +6745,20 @@ class AIAgent:
                     and "skill_manage" in self.valid_tool_names):
                 self._iters_since_skill += 1
             
-            # Prepare messages for API call
-            # If we have an ephemeral system prompt, prepend it to the messages
+            # Prepare messages for API call.
             # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
             # However, providers like Moonshot AI require a separate 'reasoning_content' field
             # on assistant messages with tool_calls. We handle both cases here.
+            turn_scoped_system_context = ""
+            if self._use_prompt_caching:
+                if self.ephemeral_system_prompt:
+                    turn_scoped_system_context = self.ephemeral_system_prompt
+                if _plugin_turn_context:
+                    turn_scoped_system_context = (
+                        f"{turn_scoped_system_context}\n\n{_plugin_turn_context}".strip()
+                        if turn_scoped_system_context else _plugin_turn_context
+                    )
+
             api_messages = []
             for idx, msg in enumerate(messages):
                 api_msg = msg.copy()
@@ -6723,6 +6766,10 @@ class AIAgent:
                 if idx == current_turn_user_idx and msg.get("role") == "user" and self._honcho_turn_context:
                     api_msg["content"] = _inject_honcho_turn_context(
                         api_msg.get("content", ""), self._honcho_turn_context
+                    )
+                if idx == current_turn_user_idx and msg.get("role") == "user" and turn_scoped_system_context:
+                    api_msg["content"] = _inject_turn_scoped_system_context(
+                        api_msg.get("content", ""), turn_scoped_system_context
                     )
 
                 # For ALL assistant messages, pass reasoning back to the API
@@ -6750,15 +6797,15 @@ class AIAgent:
                 # The signature field helps maintain reasoning continuity
                 api_messages.append(api_msg)
 
-            # Build the final system message: cached prompt + ephemeral system prompt.
-            # Ephemeral additions are API-call-time only (not persisted to session DB).
-            # Honcho later-turn recall is intentionally kept OUT of the system prompt
-            # so the stable cache prefix remains unchanged.
+            # Build the final system message.
+            # When prompt caching is active, turn-scoped guidance is attached to
+            # the live user turn instead of the system prompt so the cached
+            # system prefix remains stable across turns.
             effective_system = active_system_prompt or ""
-            if self.ephemeral_system_prompt:
+            if self.ephemeral_system_prompt and not self._use_prompt_caching:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
-            # Plugin context from pre_llm_call hooks — ephemeral, not cached.
-            if _plugin_turn_context:
+            # Plugin context from pre_llm_call hooks follows the same rule.
+            if _plugin_turn_context and not self._use_prompt_caching:
                 effective_system = (effective_system + "\n\n" + _plugin_turn_context).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
@@ -6770,12 +6817,16 @@ class AIAgent:
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
-            # Apply Anthropic prompt caching for Claude models via OpenRouter.
-            # Auto-detected: if model name contains "claude" and base_url is OpenRouter,
-            # inject cache_control breakpoints (system + last 3 messages) to reduce
-            # input token costs by ~75% on multi-turn conversations.
-            if self._use_prompt_caching:
-                api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl, native_anthropic=(self.api_mode == 'anthropic_messages'))
+            # Prompt caching:
+            # - OpenRouter Claude uses explicit block-level breakpoints.
+            # - Native Anthropic adds request-level automatic cache control later
+            #   in build_anthropic_kwargs().
+            if self._use_prompt_caching and not self._use_native_anthropic_auto_cache:
+                api_messages = apply_anthropic_cache_control(
+                    api_messages,
+                    cache_ttl=self._cache_ttl,
+                    native_anthropic=(self.api_mode == "anthropic_messages"),
+                )
 
             # Safety net: strip orphaned tool results / add stubs for missing
             # results before sending to the API.  Runs unconditionally — not
@@ -7257,6 +7308,7 @@ class AIAgent:
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+
                     
                     has_retried_429 = False  # Reset on success
                     break  # Success, exit retry loop
@@ -8426,6 +8478,26 @@ class AIAgent:
             if msg.get("role") == "assistant" and msg.get("reasoning"):
                 last_reasoning = msg["reasoning"]
                 break
+
+        # ── Session-end prompt cache summary ──────────────────────────────
+        # Emit a structured log line with cumulative cache stats so they
+        # survive in log files for post-session analysis.
+        _cache_read = self.session_cache_read_tokens
+        _cache_write = self.session_cache_write_tokens
+        _total_input = self.session_input_tokens + _cache_read + _cache_write
+        if _cache_read or _cache_write:
+            _hit_pct = (_cache_read / _total_input * 100) if _total_input > 0 else 0.0
+            logger.info(
+                "Prompt cache session summary: api_calls=%d input=%d "
+                "cache_read=%d cache_write=%d hit_pct=%.1f%%",
+                api_call_count, _total_input, _cache_read, _cache_write, _hit_pct,
+            )
+            if not self.quiet_mode:
+                self._vprint(
+                    f"{self.log_prefix}💾 Session cache: "
+                    f"{_cache_read:,} read / {_cache_write:,} written / "
+                    f"{_total_input:,} total input ({_hit_pct:.0f}% hit rate)"
+                )
 
         # Build result with interrupt info if applicable
         result = {
