@@ -4,7 +4,7 @@
 # 2. Reports deploy status to PR + linked Linear issue
 # 3. Triggers 🐾 Verifier via OpenAI API to smoke-test the deployment
 #
-# Install on: ALL priveperfumes/* repos (org-level default)
+# Install on: ALL prive-hn/* repos (org-level default)
 # New repos inherit automatically. Repos without Dockerfile/fly.toml are skipped.
 #
 # ORG-LEVEL SECRETS NEEDED:
@@ -56,7 +56,9 @@ jobs:
         if: steps.check.outputs.deployable == 'true'
         id: fly_deploy
         uses: superfly/flyctl-actions/setup-flyctl@1.5
+
       - run: flyctl deploy --remote-only --ha=false
+        if: steps.check.outputs.deployable == 'true'
         id: flyctl
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
@@ -139,8 +141,8 @@ jobs:
           Deploy status: $DEPLOY_STATUS
 
           Steps:
-          1. Try GET https://\${FLY_APP}.priveperfumes.com/health (or the repo name as subdomain)
-          2. Try GET https://\${FLY_APP}.priveperfumes.com/
+          1. Try GET https://\${FLY_APP}.prive-hn.com/health (or the repo name as subdomain)
+          2. Try GET https://\${FLY_APP}.prive-hn.com/
           3. If both return 200 → healthy
           4. If not → retry once after 30s
           5. Report result
@@ -178,7 +180,7 @@ jobs:
 
       # Update Linear issue (if LINEAR_API_KEY secret exists)
       - name: Update Linear issue
-        if: env.LINEAR_API_KEY != ''
+        if: steps.check.outputs.deployable == 'true'
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
         run: |
