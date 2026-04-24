@@ -3,7 +3,7 @@
 # 1. Calls the 🔍 Reviewer ChatGPT Agent via OpenAI API (fast path, ~2 min)
 # 2. Falls back to Codex review if API call fails
 #
-# Install on: ALL priveperfumes/* repos (org-level default)
+# Install on: ALL prive-hn/* repos (org-level default)
 # New repos inherit automatically via org-level installation.
 #
 # ORG-LEVEL SECRETS NEEDED:
