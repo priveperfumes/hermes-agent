@@ -1,0 +1,265 @@
+# Claude-Pilot: autonomous PR lifecycle.
+#
+# Source of truth: prive-hn/prive-agents (workflows/claude-pilot.yml).
+# Do not edit per-repo — re-run scripts/install.sh on prive-agents to update.
+#
+# What this does:
+#   - Fires on PR events, reviews, comments, and CI completion.
+#   - Spins up Claude (Opus 4.7) with the mission at prompts/pr-pilot.md.
+#   - Claude reviews, fixes, watches CI, triages CodeRabbit, auto-merges.
+#   - Stops itself if blocked by labelling needs-human + Discord ping.
+
+name: claude-pilot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+  check_suite:
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to re-run Claude-Pilot against
+        required: true
+        type: string
+
+# Cancel superseded runs for the same PR so a fresh push doesn't fight a stale Claude run.
+concurrency:
+  # Isolate claude[bot]'s own merge-triggered events (pull_request.closed after auto-merge)
+  # so they never enter the same group as a running pilot. Also isolate CodeRabbit/Dependabot
+  # issue_comments. Human @claude commands and real PR events share the per-PR group.
+  group: claude-pilot-${{ (github.actor == 'claude[bot]' || github.actor == 'claude-pilot[bot]') && github.run_id || (github.event_name == 'issue_comment' && github.actor != 'coderabbitai[bot]' && github.actor != 'dependabot[bot]' && github.event.issue.number) || github.event.pull_request.number || github.event.inputs.pr_number || github.event.check_suite.pull_requests[0].number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  checks: read
+  actions: read
+  statuses: read
+  id-token: write
+
+jobs:
+  pilot:
+    # Coarse guard handled at job-level: only payload fields that are stable
+    # across events. The fine-grained guard (labels, draft, attached PR for
+    # check_suite, head SHA resolution for workflow_dispatch) lives in the
+    # `Resolve PR` step below, which queries live PR state via the API.
+    if: >-
+      github.actor != 'claude[bot]' &&
+      github.actor != 'claude-pilot[bot]' &&
+      !(github.event_name == 'issue_comment' && github.actor == 'coderabbitai[bot]') &&
+      (
+        github.event_name != 'issue_comment' ||
+        github.event.issue.pull_request != null
+      )
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # Resolves a single canonical PR number from whichever event fired,
+      # then queries live PR state. This is the single source of truth for
+      # whether the run should proceed and what SHA to operate on.
+      #
+      # Sets outputs:
+      #   skip      "true" if the run should exit early (no work to do)
+      #   pr        PR number (empty if none associated)
+      #   head_sha  PR head commit SHA (use for checkout)
+      #   labels    comma-separated label names (used by later steps)
+      - name: Resolve PR and live state
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          set -euo pipefail
+
+          pr=""
+          case "${{ github.event_name }}" in
+            pull_request|pull_request_review|pull_request_review_comment)
+              pr="${{ github.event.pull_request.number }}"
+              ;;
+            issue_comment)
+              pr="${{ github.event.issue.number }}"
+              ;;
+            workflow_dispatch)
+              pr="${{ github.event.inputs.pr_number }}"
+              ;;
+            check_suite)
+              # check_suite.pull_requests is an array — empty for non-PR pushes
+              # (e.g., direct push to main). We skip those entirely.
+              pr=$(jq -r '.check_suite.pull_requests[0].number // empty' "$EVENT_PATH")
+              ;;
+          esac
+
+          if [ -z "$pr" ]; then
+            echo "::notice::No PR associated with this $GITHUB_EVENT_NAME event. Skipping."
+            {
+              echo "skip=true"
+              echo "pr="
+              echo "head_sha="
+              echo "labels="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          data=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" \
+            --json state,isDraft,headRefOid,labels 2>/dev/null || echo "")
+          if [ -z "$data" ]; then
+            echo "::warning::Could not fetch PR #$pr state. Skipping."
+            {
+              echo "skip=true"
+              echo "pr=$pr"
+              echo "head_sha="
+              echo "labels="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          state=$(echo "$data" | jq -r '.state')
+          is_draft=$(echo "$data" | jq -r '.isDraft')
+          head_sha=$(echo "$data" | jq -r '.headRefOid')
+          labels=$(echo "$data" | jq -r '[.labels[].name] | join(",")')
+
+          skip=false
+          reason=""
+          # CLOSED PR: only proceed if this is a fresh pull_request.closed event
+          # (post-merge handling). Otherwise CLOSED means done; skip.
+          if [ "$state" = "CLOSED" ]; then
+            if [ "$GITHUB_EVENT_NAME" != "pull_request" ] || [ "${{ github.event.action }}" != "closed" ]; then
+              skip=true; reason="PR #$pr is CLOSED"
+            fi
+          elif [ "$is_draft" = "true" ]; then
+            skip=true; reason="PR #$pr is a draft"
+          else
+            for blocker in needs-human claude-pilot-paused; do
+              if [[ ",$labels," == *",$blocker,"* ]]; then
+                skip=true; reason="PR #$pr has \`$blocker\` label"
+                break
+              fi
+            done
+          fi
+
+          if [ "$skip" = "true" ]; then
+            echo "::notice::Skipping: $reason"
+          fi
+
+          {
+            echo "skip=$skip"
+            echo "pr=$pr"
+            echo "head_sha=$head_sha"
+            echo "labels=$labels"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.pr.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.pr.outputs.head_sha }}
+
+      - name: Mark PR active
+        if: steps.pr.outputs.skip != 'true' && steps.pr.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit "${{ steps.pr.outputs.pr }}" \
+            --add-label "claude-pilot-active" 2>/dev/null || true
+
+      - name: Run Claude-Pilot
+        id: claude
+        if: steps.pr.outputs.skip != 'true' && !contains(steps.pr.outputs.labels, 'claude-quota-exhausted')
+        uses: anthropics/claude-code-action@v1
+        env:
+          # Event context — referenced from prompts/pr-pilot.md decision table.
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        with:
+          # Allow bot-triggered events (CodeRabbit reviews, Dependabot, etc.)
+          allowed_bots: "*"
+          # Pin to a full SHA in production via scripts/install.sh.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Fallback API key for graceful degradation when OAuth is rate-limited.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Mission lives in prompts/pr-pilot.md. Action v1 takes inline prompt
+          # text via `prompt:`, not a file path. Read it from the workspace and
+          # tack on a header pointing at the playbooks directory.
+          prompt: |
+            You are claude-pilot. Read your full mission from `prompts/pr-pilot.md`
+            in the workspace and follow it. Playbooks live under `prompts/playbooks/`.
+
+            Current PR context (do NOT try to read these from env vars — use these values directly):
+            - EVENT_NAME: ${{ github.event_name }}
+            - EVENT_ACTION: ${{ github.event.action }}
+            - PR_NUMBER: ${{ steps.pr.outputs.pr }}
+            - PR_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+            - PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+            - REPO: ${{ github.repository }}
+            - ACTOR: ${{ github.actor }}
+            - DISCORD_WEBHOOK_URL: available in env (the action will inject it when needed)
+          # Action v1: model + tool flags go into claude_args, not separate inputs.
+          # Bash sub-patterns unlock gh CLI, curl, git push, jq for PR ops.
+          # NOTE: mcp__github__* intentionally excluded — the action's sandbox
+          # does not grant MCP GitHub permissions at runtime, causing failures.
+          # All GitHub operations must go through `gh` CLI via Bash.
+          claude_args: |
+            --model claude-opus-4-7
+            --allowed-tools Bash(gh:*),Bash(curl:*),Bash(git:*),Bash(jq:*),Bash(env:*),Edit,Read,Write,Grep,Glob
+          show_full_output: true
+
+      # Fallback: Codex when label is set.
+      - name: Run Codex fallback
+        if: steps.pr.outputs.skip != 'true' && contains(steps.pr.outputs.labels, 'claude-quota-exhausted')
+        uses: openai/codex-action@v1
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr }}
+          REPO: ${{ github.repository }}
+        with:
+          # codex-action uses hyphenated input names.
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: prompts/pr-pilot.md
+
+      - name: Discord ping on failure
+        if: failure() && steps.pr.outputs.skip != 'true'
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -z "$WEBHOOK" ] && exit 0
+          PR_URL="${{ github.server_url }}/${REPO}/pull/${PR_NUMBER}"
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            "$WEBHOOK" -d '{"content":":octagonal_sign: claude-pilot run **failed** on `'"$REPO"'` PR <'"$PR_URL"'>.\nRun: <'"$RUN_URL"'>"}' || true
+
+      - name: Discord ping on merge
+        if: success() && steps.pr.outputs.skip != 'true' && steps.pr.outputs.pr != ''
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -z "$WEBHOOK" ] && exit 0
+          # Check if PR was merged by this run
+          state=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state,mergedAt --jq '.state + " " + (.mergedAt // "null")' 2>/dev/null || echo "UNKNOWN")
+          if echo "$state" | grep -q "MERGED"; then
+            PR_URL="${{ github.server_url }}/${REPO}/pull/${PR_NUMBER}"
+            curl -sS -X POST -H 'Content-Type: application/json' \
+              "$WEBHOOK" -d '{"content":":white_check_mark: `'"$REPO"'` PR #'"$PR_NUMBER"' **merged** by claude-pilot. <'"$PR_URL"'>"}' || true
+          fi
