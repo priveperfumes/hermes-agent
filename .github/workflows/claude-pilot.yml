@@ -177,7 +177,7 @@ jobs:
       - name: Run Claude-Pilot
         id: claude
         if: steps.pr.outputs.skip != 'true' && !contains(steps.pr.outputs.labels, 'claude-quota-exhausted')
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@567fe954a4527e81f132d87d1bdbcc94f7737434  # v1
         env:
           # Event context — referenced from prompts/pr-pilot.md decision table.
           EVENT_NAME: ${{ github.event_name }}
@@ -219,7 +219,7 @@ jobs:
           claude_args: |
             --model claude-opus-4-7
             --allowed-tools Bash(gh:*),Bash(curl:*),Bash(git:*),Bash(jq:*),Bash(env:*),Edit,Read,Write,Grep,Glob
-          show_full_output: true
+          # show_full_output: true  # disabled after debugging complete
 
       # Fallback: Codex when label is set.
       - name: Run Codex fallback
