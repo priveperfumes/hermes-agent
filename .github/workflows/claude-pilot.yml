@@ -20,7 +20,11 @@ on:
     types: [created]
   issue_comment:
     types: [created]
-  check_suite:
+  # Re-trigger when CI finishes. check_suite doesn't work — GitHub suppresses
+  # events from GITHUB_TOKEN to prevent loops. workflow_run fires reliably
+  # when another named workflow completes on the same repo.
+  workflow_run:
+    workflows: ["CI", "Test", "Build and Test", "Check and Test"]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -34,7 +38,7 @@ concurrency:
   # Isolate claude[bot]'s own merge-triggered events (pull_request.closed after auto-merge)
   # so they never enter the same group as a running pilot. Also isolate CodeRabbit/Dependabot
   # issue_comments. Human @claude commands and real PR events share the per-PR group.
-  group: claude-pilot-${{ (github.actor == 'claude[bot]' || github.actor == 'claude-pilot[bot]') && github.run_id || (github.event_name == 'issue_comment' && github.actor != 'coderabbitai[bot]' && github.actor != 'dependabot[bot]' && github.event.issue.number) || github.event.pull_request.number || github.event.inputs.pr_number || github.event.check_suite.pull_requests[0].number || github.run_id }}
+  group: claude-pilot-${{ (github.actor == 'claude[bot]' || github.actor == 'claude-pilot[bot]') && github.run_id || (github.event_name == 'issue_comment' && github.actor != 'coderabbitai[bot]' && github.actor != 'dependabot[bot]' && github.event.issue.number) || github.event.pull_request.number || github.event.inputs.pr_number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -93,10 +97,10 @@ jobs:
             workflow_dispatch)
               pr="${{ github.event.inputs.pr_number }}"
               ;;
-            check_suite)
-              # check_suite.pull_requests is an array — empty for non-PR pushes
-              # (e.g., direct push to main). We skip those entirely.
-              pr=$(jq -r '.check_suite.pull_requests[0].number // empty' "$EVENT_PATH")
+            workflow_run)
+              # workflow_run carries the triggering run's head_branch and
+              # pull_requests. Only act if the completed run was on a PR branch.
+              pr=$(jq -r '.workflow_run.pull_requests[0].number // empty' "$EVENT_PATH")
               ;;
           esac
 

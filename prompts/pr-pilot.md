@@ -60,7 +60,8 @@ Branch your behavior on `EVENT_NAME` + `EVENT_ACTION`:
 | `pull_request_review.submitted` | A reviewer (human or CodeRabbit) submitted a review. Triage the comments. CodeRabbit → see `playbooks/coderabbit.md`. Human → fix valid items, reply with rationale to disagreements, never resolve human threads automatically. |
 | `pull_request_review_comment.created` | New inline comment. Same triage logic. |
 | `issue_comment.created` | If body starts with `@claude` or matches a command (see "Commands" below), respond. Otherwise treat as informational and exit. |
-| `check_suite.completed` | A CI run finished. If failed → see `playbooks/ci-failure.md`. If passed and the merge gate is now satisfied → enable auto-merge. |
+| `check_suite.completed` | A CI run finished. If failed → see `playbooks/ci-failure.md`. If passed and the merge gate is now satisfied → merge immediately. |
+| `workflow_run` | Same as `check_suite.completed` — a CI workflow finished. Re-check the full merge gate and merge if satisfied. |
 | `pull_request.closed` (with `merged == true`) | The PR has just merged. Run the **Post-merge** section. Skip everything else. |
 | `pull_request.closed` (with `merged == false`) | PR closed without merging. Comment `🛩️ claude-pilot: PR closed unmerged. Standing down.` and exit. |
 | `workflow_dispatch` | Manual re-run. Treat like `pull_request.synchronize`: re-read state and decide. |
@@ -89,9 +90,12 @@ After pushing fixes (or if there were none to push), check CI status **immediate
 
 **Active merge pattern:**
 1. Run `gh pr checks $PR_NUMBER --repo $REPO` to see current CI status.
-2. If all checks are `pass`/`success` → evaluate the merge gate immediately.
-3. If checks are `pending`/`running` → exit cleanly. The next push or event will re-trigger and re-check.
+2. If all checks are `pass`/`success` → evaluate the merge gate immediately and merge.
+3. If checks are `pending`/`running` → **enable auto-merge** so GitHub merges when CI passes: `gh pr merge $PR_NUMBER --repo $REPO --squash --delete-branch --auto`. This avoids depending on a re-trigger.
 4. If any check `failed` → see `playbooks/ci-failure.md`.
+5. If no CI is configured (no checks found) → skip CI requirement, evaluate remaining merge gate conditions, and merge.
+
+For repos without a CI workflow: there are no CI checks to wait for. Evaluate the other merge gate conditions and merge immediately.
 
 CodeRabbit reviews: if it hasn't reviewed yet and the merge gate is otherwise satisfied, proceed without it. Don't block the merge waiting for a review that may never come.
 
