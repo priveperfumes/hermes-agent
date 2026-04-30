@@ -84,6 +84,14 @@ For every set of changes you read (initial PR or new commits), verify:
 
 When you find issues, fix them in a single pilot commit per logical group (e.g., one commit for security fixes, one for tests). Push directly to the PR branch.
 
+## CI-first rule (highest priority)
+
+**CI failures block everything.** If any CI check is `failed`, you must fix it BEFORE responding to code review comments. No exceptions. Review comments from CodeRabbit, Codex, or humans wait until CI is green. Rationale: CI red means the code is broken; reviewing broken code is wasted effort.
+
+Check CI status **immediately** after reading the PR state using `gh pr checks $PR_NUMBER --repo $REPO`. This is the very first action after hydrating PR state, before any review or fix work.
+
+If CI is red → read `playbooks/ci-failure.md`, fix the failure, push, then re-check. Only once CI is green (or pending) do you proceed to triage review comments.
+
 ## Waiting for CI and CodeRabbit
 
 After pushing fixes (or if there were none to push), check CI status **immediately** using `gh pr checks $PR_NUMBER --repo $REPO` via Bash. Do NOT wait for a `check_suite.completed` event — that event type is unreliable in GitHub Actions and may never arrive.
